@@ -3,7 +3,7 @@
 name: Nightly Tests
 on:
   schedule:
-    # Once weekly on Mondays at 04:00 UTC.
+    # Once daily at 04:00 UTC.
     #
     #        ┌───────────── minute           (0 - 59)
     #        │  ┌────────── hour             (0 - 23)
@@ -13,10 +13,15 @@ on:
     #        │  │  │  │  │
     #        │  │  │  │  │
     #        │  │  │  │  │
-    - cron: '0  4  *  *  1'
+    - cron: '0  4  *  *  *'
   push:
     branches:
       - 'develop'
+    paths:
+      - '.github/workflows/nightly-tests.yml'
+  pull_request:
+    branches:
+      - '**'
     paths:
       - '.github/workflows/nightly-tests.yml'
   workflow_dispatch:
