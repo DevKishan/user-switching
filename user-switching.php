@@ -79,6 +79,9 @@ final class user_switching {
 		add_action( 'admin_bar_menu', [ $this, 'action_admin_bar_menu' ], 11 );
 		add_action( 'shutdown', [ $this, 'action_shutdown_for_wp_die' ], 1, 0 );
 
+		// Switch back nonce cleanup:
+		add_action( 'wp_scheduled_delete', [ $this, 'action_cleanup_expired_switch_back_nonces' ] );
+
 		// BuddyPress integration:
 		add_action( 'bp_member_header_actions', [ $this, 'action_bp_button' ], 11 );
 		add_action( 'bp_directory_members_actions', [ $this, 'action_bp_button' ], 11 );
@@ -254,19 +257,46 @@ final class user_switching {
 
 			// We're attempting to switch back to the originating user:
 			case 'switch_to_olduser':
-				// Fetch the originating user data:
-				$old_user = self::get_old_user();
-				if ( ! $old_user ) {
-					wp_die( esc_html__( 'Could not switch users.', 'user-switching' ), 400 );
-				}
+				// Check if we have a persistent switch back nonce
+				if ( ! empty( $_REQUEST['switch_back_nonce'] ) && ! empty( $_REQUEST['original_user'] ) ) {
+					$switch_back_nonce = sanitize_text_field( $_REQUEST['switch_back_nonce'] );
+					$original_user_id = absint( $_REQUEST['original_user'] );
+					$current_user_id = get_current_user_id();
+					
+					// Verify the persistent nonce
+					$nonce_verification = self::verify_switch_back_nonce( $switch_back_nonce, $original_user_id, $current_user_id );
+					if ( is_wp_error( $nonce_verification ) ) {
+						wp_die( esc_html( $nonce_verification->get_error_message() ), 403 );
+					}
+					
+					// Get the original user
+					$old_user = get_userdata( $original_user_id );
+					if ( ! $old_user ) {
+						wp_die( esc_html__( 'Could not switch users.', 'user-switching' ), 400 );
+					}
+					
+					// Clean up the used nonce
+					$active_switches = get_user_meta( $current_user_id, '_user_switching_switch_backs', true );
+					if ( is_array( $active_switches ) && isset( $active_switches[ $switch_back_nonce ] ) ) {
+						unset( $active_switches[ $switch_back_nonce ] );
+						update_user_meta( $current_user_id, '_user_switching_switch_backs', $active_switches );
+					}
+				} else {
+					// Fall back to original method for backward compatibility
+					// Fetch the originating user data:
+					$old_user = self::get_old_user();
+					if ( ! $old_user ) {
+						wp_die( esc_html__( 'Could not switch users.', 'user-switching' ), 400 );
+					}
 
-				// Check authentication:
-				if ( ! self::authenticate_old_user( $old_user ) ) {
-					wp_die( esc_html__( 'Could not switch users.', 'user-switching' ), 403 );
-				}
+					// Check authentication:
+					if ( ! self::authenticate_old_user( $old_user ) ) {
+						wp_die( esc_html__( 'Could not switch users.', 'user-switching' ), 403 );
+					}
 
-				// Check intent:
-				check_admin_referer( "switch_to_olduser_{$old_user->ID}" );
+					// Check intent:
+					check_admin_referer( "switch_to_olduser_{$old_user->ID}" );
+				}
 
 				$current_user = wp_get_current_user();
 
@@ -1010,10 +1040,17 @@ final class user_switching {
 	 * @return string The required URL.
 	 */
 	public static function switch_back_url( WP_User $user ): string {
-		return wp_nonce_url( add_query_arg( [
+		$current_user_id = get_current_user_id();
+		
+		// Create a persistent switch back nonce
+		$switch_back_nonce = self::create_switch_back_nonce( $user->ID, $current_user_id );
+		
+		return add_query_arg( [
 			'action' => 'switch_to_olduser',
+			'switch_back_nonce' => $switch_back_nonce,
+			'original_user' => $user->ID,
 			'nr' => 1,
-		], wp_login_url() ), "switch_to_olduser_{$user->ID}" );
+		], wp_login_url() );
 	}
 
 	/**
@@ -1028,6 +1065,96 @@ final class user_switching {
 			'action' => 'switch_off',
 			'nr' => 1,
 		], wp_login_url() ), 'switch_off' );
+	}
+
+	/**
+	 * Creates a persistent switch back nonce that survives session invalidation.
+	 *
+	 * @param int $original_user_id The ID of the original user to switch back to.
+	 * @param int $current_user_id The ID of the current user who will switch back.
+	 * @return string The switch back nonce.
+	 */
+	public static function create_switch_back_nonce( int $original_user_id, int $current_user_id ): string {
+		// Generate a unique nonce for this switch back action
+		$nonce_data = [
+			'original_user' => $original_user_id,
+			'current_user' => $current_user_id,
+			'created' => time(),
+			'expires' => time() + (24 * HOUR_IN_SECONDS), // 24 hours expiration
+		];
+		
+		// Create a unique nonce key based on the users and timestamp
+		$nonce_key = 'switch_back_' . hash( 'sha256', serialize( $nonce_data ) );
+		
+		// Store the nonce data in user meta for the current user
+		$active_switches = get_user_meta( $current_user_id, '_user_switching_switch_backs', true );
+		if ( ! is_array( $active_switches ) ) {
+			$active_switches = [];
+		}
+		
+		$active_switches[ $nonce_key ] = $nonce_data;
+		update_user_meta( $current_user_id, '_user_switching_switch_backs', $active_switches );
+		
+		return $nonce_key;
+	}
+
+	/**
+	 * Verifies a persistent switch back nonce.
+	 *
+	 * @param string $nonce The nonce to verify.
+	 * @param int $original_user_id The ID of the original user.
+	 * @param int $current_user_id The ID of the current user.
+	 * @return bool|WP_Error True if valid, WP_Error if invalid.
+	 */
+	public static function verify_switch_back_nonce( string $nonce, int $original_user_id, int $current_user_id ) {
+		// Get stored switch back nonces for the current user
+		$active_switches = get_user_meta( $current_user_id, '_user_switching_switch_backs', true );
+		if ( ! is_array( $active_switches ) || ! isset( $active_switches[ $nonce ] ) ) {
+			return new WP_Error( 'invalid_nonce', __( 'The switch back link is invalid.', 'user-switching' ) );
+		}
+		
+		$nonce_data = $active_switches[ $nonce ];
+		
+		// Verify the nonce data matches the request
+		if ( $nonce_data['original_user'] !== $original_user_id || 
+			 $nonce_data['current_user'] !== $current_user_id ) {
+			return new WP_Error( 'invalid_switch', __( 'Switch back data mismatch.', 'user-switching' ) );
+		}
+		
+		// Check if the nonce has expired
+		if ( time() > $nonce_data['expires'] ) {
+			// Clean up expired nonce
+			unset( $active_switches[ $nonce ] );
+			update_user_meta( $current_user_id, '_user_switching_switch_backs', $active_switches );
+			return new WP_Error( 'expired_nonce', __( 'The switch back link has expired.', 'user-switching' ) );
+		}
+		
+		return true;
+	}
+
+	/**
+	 * Cleans up expired switch back nonces for a user.
+	 *
+	 * @param int $user_id The user ID to clean up nonces for.
+	 */
+	public static function cleanup_expired_switch_back_nonces( int $user_id ): void {
+		$active_switches = get_user_meta( $user_id, '_user_switching_switch_backs', true );
+		if ( ! is_array( $active_switches ) ) {
+			return;
+		}
+		
+		$cleaned_switches = [];
+		$current_time = time();
+		
+		foreach ( $active_switches as $nonce => $data ) {
+			if ( $current_time <= $data['expires'] ) {
+				$cleaned_switches[ $nonce ] = $data;
+			}
+		}
+		
+		if ( count( $cleaned_switches ) !== count( $active_switches ) ) {
+			update_user_meta( $user_id, '_user_switching_switch_backs', $cleaned_switches );
+		}
 	}
 
 	/**
@@ -1225,6 +1352,25 @@ final class user_switching {
 		}
 
 		$wc->session->forget_session();
+	}
+
+	/**
+	 * Handles cleanup of expired switch back nonces for all users.
+	 */
+	public function action_cleanup_expired_switch_back_nonces(): void {
+		global $wpdb;
+		
+		// Get all users who have switch back nonces
+		$users = $wpdb->get_results( 
+			$wpdb->prepare(
+				"SELECT user_id FROM {$wpdb->usermeta} WHERE meta_key = %s",
+				'_user_switching_switch_backs'
+			)
+		);
+		
+		foreach ( $users as $user ) {
+			self::cleanup_expired_switch_back_nonces( intval( $user->user_id ) );
+		}
 	}
 
 	/**
