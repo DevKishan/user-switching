@@ -998,6 +998,8 @@ final class user_switching {
 			'user_switched',
 			'switched_off',
 			'switched_back',
+			'switch_back_nonce',
+			'original_user',
 		] );
 	}
 
@@ -1041,6 +1043,14 @@ final class user_switching {
 	 */
 	public static function switch_back_url( WP_User $user ): string {
 		$current_user_id = get_current_user_id();
+		
+		// If no current user, fall back to the original method
+		if ( ! $current_user_id ) {
+			return wp_nonce_url( add_query_arg( [
+				'action' => 'switch_to_olduser',
+				'nr' => 1,
+			], wp_login_url() ), "switch_to_olduser_{$user->ID}" );
+		}
 		
 		// Create a persistent switch back nonce
 		$switch_back_nonce = self::create_switch_back_nonce( $user->ID, $current_user_id );
